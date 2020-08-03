@@ -73,14 +73,7 @@ static inline float32x4_t activation_ps(float32x4_t _v, int activation_type, con
     }
     else if (activation_type == 4)
     {
-        float32x4_t _one = vdupq_n_f32(1.f);
-        _v = vnegq_f32(_v);
-        _v = exp_ps(_v);
-        _v = vaddq_f32(_v, _one);
-        float32x4_t _outp = vrecpeq_f32(_v);
-        _outp = vmulq_f32(vrecpsq_f32(_v, _outp), _outp);
-        //         _outp = vmulq_f32(vrecpsq_f32(_v, _outp), _outp);
-        _v = _outp;
+        _v = sigmoid_ps(_v);
     }
     else if (activation_type == 5)
     {
@@ -89,4 +82,28 @@ static inline float32x4_t activation_ps(float32x4_t _v, int activation_type, con
 
     return _v;
 }
+#if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+static inline __fp16 activation_ss(__fp16 v, int activation_type, const ncnn::Mat& activation_params)
+{
+    float v32 = v;
+    v32 = activation_ss(v32, activation_type, activation_params);
+    return (__fp16)v32;
+}
+
+static inline float16x4_t activation_ps(float16x4_t _v, int activation_type, const ncnn::Mat& activation_params)
+{
+    float32x4_t _v32 = vcvt_f32_f16(_v);
+    _v32 = activation_ps(_v32, activation_type, activation_params);
+    return vcvt_f16_f32(_v32);
+}
+
+static inline float16x8_t activation_ps(float16x8_t _v, int activation_type, const ncnn::Mat& activation_params)
+{
+    float32x4_t _v32_low = vcvt_f32_f16(vget_low_f16(_v));
+    float32x4_t _v32_high = vcvt_f32_f16(vget_high_f16(_v));
+    _v32_low = activation_ps(_v32_low, activation_type, activation_params);
+    _v32_high = activation_ps(_v32_high, activation_type, activation_params);
+    return vcombine_f16(vcvt_f16_f32(_v32_low), vcvt_f16_f32(_v32_high));
+}
+#endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 #endif // __ARM_NEON

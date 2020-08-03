@@ -29,7 +29,10 @@ Option::Option()
     blob_vkallocator = 0;
     workspace_vkallocator = 0;
     staging_vkallocator = 0;
+    pipeline_cache = 0;
 #endif // NCNN_VULKAN
+
+    openmp_blocktime = 20;
 
     use_winograd_convolution = true;
     use_sgemm_convolution = true;
@@ -49,6 +52,8 @@ Option::Option()
     use_image_storage = false;
 
     use_bf16_storage = false;
+
+    use_weight_fp16_storage = false;
 }
 
 } // namespace ncnn

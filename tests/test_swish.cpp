@@ -21,12 +21,7 @@ static int test_swish(const ncnn::Mat& a)
 
     std::vector<ncnn::Mat> weights(0);
 
-    ncnn::Option opt;
-    opt.num_threads = 1;
-    opt.use_vulkan_compute = true;
-    opt.use_int8_inference = false;
-
-    int ret = test_layer<ncnn::Swish>("Swish", pd, weights, opt, a);
+    int ret = test_layer<ncnn::Swish>("Swish", pd, weights, a);
     if (ret != 0)
     {
         fprintf(stderr, "test_swish failed a.dims=%d a=(%d %d %d)\n", a.dims, a.w, a.h, a.c);
@@ -38,21 +33,24 @@ static int test_swish(const ncnn::Mat& a)
 static int test_swish_0()
 {
     return 0
-           || test_swish(RandomMat(6, 7, 16))
+           || test_swish(RandomMat(5, 7, 24))
+           || test_swish(RandomMat(7, 9, 12))
            || test_swish(RandomMat(3, 5, 13));
 }
 
 static int test_swish_1()
 {
     return 0
-           || test_swish(RandomMat(6, 16))
-           || test_swish(RandomMat(7, 15));
+           || test_swish(RandomMat(15, 24))
+           || test_swish(RandomMat(17, 12))
+           || test_swish(RandomMat(19, 15));
 }
 
 static int test_swish_2()
 {
     return 0
            || test_swish(RandomMat(128))
+           || test_swish(RandomMat(124))
            || test_swish(RandomMat(127));
 }
 

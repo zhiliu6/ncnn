@@ -22,8 +22,6 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(Sigmoid_x86)
-
 Sigmoid_x86::Sigmoid_x86()
 {
 #if __AVX__
@@ -67,7 +65,7 @@ int Sigmoid_x86::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         int remain = size & 7;
 #else
         int remain = size;
-#endif // __ARM_NEON
+#endif // __AVX__
 
 #if __AVX__
         for (; nn > 0; nn--)
@@ -76,7 +74,7 @@ int Sigmoid_x86::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             _mm256_storeu_ps(ptr, sigmoid_avx(_p));
             ptr += 8;
         }
-#endif // __ARM_NEON
+#endif // __AVX__
         for (; remain > 0; remain--)
         {
             *ptr = 1.f / (1.f + exp(-*ptr));

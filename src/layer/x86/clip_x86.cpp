@@ -19,8 +19,6 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(Clip_x86)
-
 Clip_x86::Clip_x86()
 {
 #if __AVX__
@@ -82,4 +80,5 @@ int Clip_x86::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
     return 0;
 }
+
 } //namespace ncnn

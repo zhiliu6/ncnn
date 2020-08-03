@@ -21,8 +21,6 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(Convolution_vulkan)
-
 Convolution_vulkan::Convolution_vulkan()
 {
     support_vulkan = true;
@@ -81,6 +79,8 @@ int Convolution_vulkan::create_pipeline(const Option& _opt)
         pd.set(0, num_output);
         pd.set(1, bias_term);
         pd.set(2, weight_data_size); // TODO int8
+        pd.set(9, activation_type);
+        pd.set(10, activation_params);
 
         innerproduct->load_param(pd);
 
@@ -206,6 +206,13 @@ int Convolution_vulkan::create_pipeline(const Option& _opt)
         Mat weight_data_packed_tm(16, num_input / elempack, num_output / out_elempack, (size_t)4 * elempack * out_elempack, elempack * out_elempack);
         if (!vkdev->shape_support_image_storage(weight_data_packed_tm))
         {
+            support_image_storage = false;
+            opt.use_image_storage = false;
+        }
+
+        if (vkdev->info.vendor_id == 0x5143 && vkdev->info.api_version < VK_MAKE_VERSION(1, 0, 66))
+        {
+            // FIXME workaround qcom adreno image shader produce wrong result on old drivers
             support_image_storage = false;
             opt.use_image_storage = false;
         }

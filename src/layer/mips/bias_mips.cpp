@@ -14,15 +14,13 @@
 
 #include "bias_mips.h"
 
-#if __MIPS_MSA
+#if __mips_msa
 #include "mips_common.h"
 
 #include <msa.h>
-#endif // __MIPS_MSA
+#endif // __mips_msa
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(Bias_mips)
 
 int Bias_mips::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 {
@@ -39,14 +37,14 @@ int Bias_mips::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
         float bias = bias_ptr[q];
 
-#if __MIPS_MSA
+#if __mips_msa
         int nn = size >> 2;
         int remain = size - (nn << 2);
 #else
         int remain = size;
-#endif // __MIPS_MSA
+#endif // __mips_msa
 
-#if __MIPS_MSA
+#if __mips_msa
         v4f32 _bias = (v4f32)__msa_fill_w_f32(bias);
         for (; nn > 0; nn--)
         {
@@ -56,7 +54,7 @@ int Bias_mips::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
             ptr += 4;
         }
-#endif // __MIPS_MSA
+#endif // __mips_msa
 
         for (; remain > 0; remain--)
         {
