@@ -17,365 +17,15 @@
 #include <map>
 #include <set>
 
-#include <llvm/ADT/APFloat.h>
-#include <llvm/ADT/APInt.h>
-#include <llvm/ADT/ArrayRef.h>
-#include <llvm/ADT/STLExtras.h>
-#include <llvm/ADT/SmallVector.h>
-#include <llvm/ADT/StringRef.h>
-#include <llvm/Support/FormatVariadic.h>
-#include <llvm/Support/MathExtras.h>
 #include <mlir/Dialect/StandardOps/IR/Ops.h>
-#include <mlir/Dialect/Traits.h>
-#include <mlir/IR/Attributes.h>
-#include <mlir/IR/Builders.h>
-#include <mlir/IR/Dialect.h>
-#include <mlir/IR/DialectImplementation.h>
-#include <mlir/IR/Function.h>
-#include <mlir/IR/Location.h>
-#include <mlir/IR/MLIRContext.h>
-#include <mlir/IR/Module.h>
-#include <mlir/IR/OpDefinition.h>
-#include <mlir/IR/OpImplementation.h>
-#include <mlir/IR/Operation.h>
-#include <mlir/IR/OperationSupport.h>
 #include <mlir/IR/PatternMatch.h>
-#include <mlir/IR/StandardTypes.h>
-#include <mlir/IR/TypeUtilities.h>
-#include <mlir/IR/Types.h>
-#include <mlir/IR/Value.h>
-#include <mlir/IR/Verifier.h>
-#include <mlir/Interfaces/CallInterfaces.h>
-#include <mlir/Interfaces/DerivedAttributeOpInterface.h>
-#include <mlir/Interfaces/InferTypeOpInterface.h>
-#include <mlir/Interfaces/LoopLikeInterface.h>
-#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Parser.h>
-#include <mlir/Support/LogicalResult.h>
-#include <mlir/Transforms/InliningUtils.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Transforms/Passes.h>
 
-#include "tf_attributes.h"
-#include "tf_side_effects.h"
-#include "tf_traits.h"
-
-namespace mlir {
-
-static LogicalResult Verify(...)
-{
-    return success();
-}
-static LogicalResult VerifyPartitionedCall(...)
-{
-    return success();
-}
-static LogicalResult VerifyStridedSliceBase(...)
-{
-    return success();
-}
-static LogicalResult VerifyUnsortedSegmentReduction(...)
-{
-    return success();
-}
-
-namespace TF {
-
-#include "tf_op_interfaces.h.inc"
-
-class TensorFlowDialect : public mlir::Dialect
-{
-public:
-    TensorFlowDialect(mlir::MLIRContext* context);
-
-    static StringRef getDialectNamespace()
-    {
-        return "tf";
-    }
-
-    Attribute parseAttribute(DialectAsmParser& parser, Type type) const override;
-
-    // Parse a type registered to this dialect.
-    Type parseType(DialectAsmParser& parser) const override;
-
-    // Parses resource type with potential subtypes.
-    Type ParseResourceType(DialectAsmParser& parser, Location loc) const;
-
-    // Parse and print variant type. It may have subtypes inferred using shape
-    // inference.
-    Type ParseVariantType(DialectAsmParser& parser, Location loc) const;
-
-    // Registered hook to materialize a constant operation from a given attribute
-    // value with the desired resultant type.
-    Operation* materializeConstant(OpBuilder& builder, Attribute value, Type type,
-                                   Location loc) override;
-};
-
-#define GET_OP_CLASSES
-#include "tf_ops.h.inc"
-
-TensorFlowDialect::TensorFlowDialect(mlir::MLIRContext* context)
-    : mlir::Dialect("tf", context, TypeID::get<TensorFlowDialect>())
-{
-    addOperations<
-#define GET_OP_LIST
-#include "tf_ops.cpp.inc"
-    >();
-
-    addTypes<
-#define HANDLE_TF_TYPE(tftype, enumerant, name)      tftype##Type,
-#define HANDLE_LAST_TF_TYPE(tftype, enumerant, name) tftype##Type
-#include "tf_types.def"
-    >();
-    addAttributes<ShapeAttr, FuncAttr>();
-
-    // Support unknown operations because not all TensorFlow operations are
-    // registered.
-    allowUnknownOperations();
-}
-
-ShapeAttr ParseShapeAttr(MLIRContext* context, StringRef spec, Location loc)
-{
-    auto emit_error = [&, spec]() {
-        emitError(loc, "invalid TensorFlow shape attribute: ") << spec;
-        return nullptr;
-    };
-
-    if (!spec.consume_front("shape<")) return emit_error();
-
-    if (spec.consume_front("*>"))
-        return mlir::TF::ShapeAttr::get(context, llvm::None);
-
-    SmallVector<int64_t, 4> shape;
-    while (!spec.consume_front(">"))
-    {
-        int64_t dim;
-
-        if (spec.consume_front("?"))
-            dim = -1;
-        else if (spec.consumeInteger(10, dim) || dim < 0)
-            return emit_error();
-
-        spec.consume_front("x");
-
-        shape.push_back(dim);
-    }
-
-    return mlir::TF::ShapeAttr::get(context, llvm::makeArrayRef(shape));
-}
-
-// Parses a #tf.func attribute of the following format:
-//
-//   #tf.func<@symbol, {attr = "value"}>
-//
-// where the first element is a SymbolRefAttr and the second element is a
-// DictionaryAttr.
-FuncAttr ParseFuncAttr(MLIRContext* context, StringRef spec, Location loc)
-{
-    auto emit_error = [&, spec]() {
-        emitError(loc, "invalid TensorFlow func attribute: ") << spec;
-        return nullptr;
-    };
-
-    if (!spec.consume_front("func<")) return emit_error();
-
-    size_t func_name_num_read = 0;
-    Attribute func_name_attr = mlir::parseAttribute(spec, context, func_name_num_read);
-    if (!func_name_attr || !func_name_attr.isa<SymbolRefAttr>())
-        return emit_error();
-    spec = spec.drop_front(func_name_num_read);
-
-    if (!spec.consume_front(", ")) return emit_error();
-
-    size_t func_attrs_num_read = 0;
-    Attribute func_attrs_attr = mlir::parseAttribute(spec, context, func_attrs_num_read);
-    if (!func_attrs_attr || !func_attrs_attr.isa<DictionaryAttr>())
-        return emit_error();
-    spec = spec.drop_front(func_attrs_num_read);
-
-    if (!spec.consume_front(">")) return emit_error();
-
-    return mlir::TF::FuncAttr::get(context, func_name_attr.cast<SymbolRefAttr>(),
-                                   func_attrs_attr.cast<DictionaryAttr>());
-}
-
-Attribute TensorFlowDialect::parseAttribute(DialectAsmParser& parser,
-        Type type) const
-{
-    auto spec = parser.getFullSymbolSpec();
-    Location loc = parser.getEncodedSourceLoc(parser.getNameLoc());
-
-    if (spec.startswith("shape")) return ParseShapeAttr(getContext(), spec, loc);
-
-    if (spec.startswith("func")) return ParseFuncAttr(getContext(), spec, loc);
-
-    return (emitError(loc, "unknown TensorFlow attribute: " + spec), nullptr);
-}
-
-// Parses a type registered to this dialect.
-Type TensorFlowDialect::parseType(DialectAsmParser& parser) const
-{
-    StringRef data;
-    if (parser.parseKeyword(&data)) return Type();
-
-    Location loc = parser.getEncodedSourceLoc(parser.getNameLoc());
-    auto typeKind = llvm::StringSwitch<unsigned>(data)
-#define HANDLE_TF_TYPE(tftype, enumerant, name) \
-    .Case(name, TensorFlowTypes::enumerant)
-// Custom TensorFlow types are handled separately at the end as they do partial
-// match.
-#define HANDLE_CUSTOM_TF_TYPE(tftype, enumerant, name)
-// NOLINTNEXTLINE
-#include "tf_types.def"
-                    .StartsWith("resource", TensorFlowTypes::RESOURCE)
-                    .StartsWith("variant", TensorFlowTypes::VARIANT)
-                    .Default(0);
-    switch (typeKind)
-    {
-    default:
-        return (emitError(loc, "unknown TensorFlow type: " + data), nullptr);
-
-#define HANDLE_TF_TYPE(tftype, enumerant, name) \
-    case TensorFlowTypes::enumerant:            \
-        return tftype##Type::get(getContext());
-#define HANDLE_CUSTOM_TF_TYPE(tftype, enumerant, name)
-// NOLINTNEXTLINE
-#include "tf_types.def"
-    case TensorFlowTypes::RESOURCE:
-        return ParseResourceType(parser, loc);
-    case TensorFlowTypes::VARIANT:
-        return ParseVariantType(parser, loc);
-    }
-}
-
-namespace {
-template<typename TypeWithSubtype>
-Type ParseTypeWithSubtype(MLIRContext* context, DialectAsmParser& parser,
-                          Location loc)
-{
-    // Default type without inferred subtypes.
-    if (failed(parser.parseOptionalLess())) return TypeWithSubtype::get(context);
-
-    // Most types with subtypes have only one subtype.
-    SmallVector<TensorType, 1> subtypes;
-    do
-    {
-        TensorType tensor_ty;
-        if (parser.parseType(tensor_ty)) return Type();
-        subtypes.push_back(tensor_ty);
-    } while (succeeded(parser.parseOptionalComma()));
-
-    if (parser.parseGreater()) return Type();
-    return TypeWithSubtype::getChecked(subtypes, context, loc);
-}
-} // anonymous namespace
-
-Type TensorFlowDialect::ParseResourceType(DialectAsmParser& parser,
-        Location loc) const
-{
-    return ParseTypeWithSubtype<ResourceType>(getContext(), parser, loc);
-}
-
-Type TensorFlowDialect::ParseVariantType(DialectAsmParser& parser,
-        Location loc) const
-{
-    return ParseTypeWithSubtype<VariantType>(getContext(), parser, loc);
-}
-
-Operation* TensorFlowDialect::materializeConstant(OpBuilder& builder,
-        Attribute value, Type type,
-        Location loc)
-{
-    return builder.create<ConstOp>(loc, type, value);
-}
-
-#define GET_OP_CLASSES
-#include "tf_ops.cpp.inc"
-
-// Builds a constant op with the specified attribute `value`. The result
-// op's type is deduced from `value`; if `value` is of scalar type,
-// wraps it up with a tensor type of empty shape.
-// TODO(jpienaar): This one differs from the autogenerated one as it takes an
-// attribute but always creates an ElementsAttr internally.
-void ConstOp::build(OpBuilder& builder, OperationState& result,
-                    Attribute value)
-{
-    ShapedType type;
-    if (auto elem_attr = value.dyn_cast<ElementsAttr>())
-    {
-        return ConstOp::build(builder, result, elem_attr);
-    }
-    else if (value.isa<BoolAttr>() || value.isa<FloatAttr>() || value.isa<IntegerAttr>())
-    {
-        // All TensorFlow types must be tensor types. In the build() method,
-        // we want to provide more flexibility by allowing attributes of scalar
-        // types. But we need to wrap it up with ElementsAttr to construct
-        // valid TensorFlow constants.
-        type = RankedTensorType::get(/*shape=*/ {}, value.getType());
-        return ConstOp::build(builder, result, DenseElementsAttr::get(type, value));
-    }
-    // TODO(jpienaar): support other TensorFlow specific types.
-    llvm_unreachable("unsupported attribute type for building tf.Const");
-}
-
-void ConstOp::build(OpBuilder& builder, OperationState& result, Type type,
-                    Attribute value)
-{
-    // Handle the case where the type and value are already tensors.
-    if (type.isa<TensorType>() && value.isa<ElementsAttr>())
-    {
-        result.addTypes(type);
-        result.addAttribute("value", value);
-        return;
-    }
-
-    // Otherwise, default to the attribute builder.
-    ConstOp::build(builder, result, value);
-    assert(type == result.types[0] && "type mismatch in construction");
-}
-
-LogicalResult ConstOp::inferReturnTypes(
-    MLIRContext* context, Optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, RegionRange regions,
-    SmallVectorImpl<Type>& inferredReturnTypes)
-{
-    auto value = attributes.get("value");
-    if (!value) return emitOptionalError(location, "missing attribute 'value'");
-    if (auto elem_attr = value.dyn_cast<ElementsAttr>())
-    {
-        inferredReturnTypes.assign({elem_attr.getType()});
-        return success();
-    }
-    return emitOptionalError(location,
-                             "attribute 'value' failed to satisfy constraint: "
-                             "constant vector/tensor");
-}
-
-Region& WhileRegionOp::getLoopBody()
-{
-    return body();
-}
-
-bool WhileRegionOp::isDefinedOutsideOfLoop(Value value)
-{
-    // If the Op defining the value exists and the defining op is outside the
-    // scope of this WhileRegion, then we can infer that its defined outside.
-    // The defining Op is outside the scope of this WhileRegion if this
-    // WhileRegionOp is not an ancestor of the defining op in the parent chain.
-    Operation* def_op = value.getDefiningOp();
-    return def_op && !getOperation()->isAncestor(def_op);
-}
-
-LogicalResult WhileRegionOp::moveOutOfLoop(
-    llvm::ArrayRef<mlir::Operation*> ops)
-{
-    // Move the hoisted value to just before the while.
-    Operation* while_op = this->getOperation();
-    for (auto op : ops) op->moveBefore(while_op);
-    return success();
-}
-
-} // namespace TF
-
-} // namespace mlir
+#include "tf_dialect.h"
+#include "ncnn_dialect.h"
 
 static std::string get_mlir_value_uniq_id(const mlir::Value& value)
 {
@@ -383,7 +33,14 @@ static std::string get_mlir_value_uniq_id(const mlir::Value& value)
     {
         mlir::FileLineColLoc floc = value.getLoc().cast<mlir::FileLineColLoc>();
 
-        return floc.getFilename().str() + ":" + std::to_string(floc.getLine()) + ":" + std::to_string(floc.getColumn());
+        return std::to_string(floc.getLine()) + ":" + std::to_string(floc.getColumn());
+    }
+
+    if (value.getLoc().isa<mlir::FusedLoc>())
+    {
+        mlir::FileLineColLoc floc = value.getLoc().cast<mlir::FusedLoc>().getLocations().front().cast<mlir::FileLineColLoc>();
+
+        return std::to_string(floc.getLine()) + ":" + std::to_string(floc.getColumn());
     }
 
     fprintf(stderr, "unhandled get_mlir_value_uniq_id\n");
@@ -588,15 +245,32 @@ static std::vector<float> get_operation_attr_af(const mlir::Operation& _operatio
 
 int main(int argc, char** argv)
 {
-    const char* mlirpath = argv[1];
-    const char* ncnn_prototxt = argc >= 4 ? argv[2] : "ncnn.param";
-    const char* ncnn_modelbin = argc >= 4 ? argv[3] : "ncnn.bin";
+    if (!(argc == 2 || argc == 4))
+    {
+        fprintf(stderr, "Usage: %s [mlir] [ncnnparam] [ncnnbin]\n", argv[0]);
+        return -1;
+    }
 
-    mlir::registerDialect<mlir::StandardOpsDialect>();
-    mlir::registerDialect<mlir::TF::TensorFlowDialect>();
+    const char* mlirpath = argv[1];
+    const char* ncnn_prototxt = argc == 4 ? argv[2] : "ncnn.param";
+    const char* ncnn_modelbin = argc == 4 ? argv[3] : "ncnn.bin";
 
     mlir::MLIRContext context;
+
+    context.getOrLoadDialect<mlir::StandardOpsDialect>();
+    context.getOrLoadDialect<mlir::TF::TensorFlowDialect>();
+    context.getOrLoadDialect<mlir::ncnn::NCNNDialect>();
+
     mlir::OwningModuleRef m = mlir::parseSourceFile(mlirpath, &context);
+
+    mlir::PassManager pm(&context);
+
+    pm.addNestedPass<mlir::FuncOp>(mlir::ncnn::createNCNNOptimizePass());
+    if (pm.run(*m).failed())
+    {
+        fprintf(stderr, "canonicalizer pass failed\n");
+        return -1;
+    }
 
     //     m->dump();
 
@@ -614,9 +288,6 @@ int main(int argc, char** argv)
 
     // weight node and weight reshape node
     std::map<std::string, mlir::Attribute> weights;
-
-    // weight node before BinaryOp
-    std::map<std::string, mlir::Attribute> binaryop_weights;
 
     fprintf(pp, "7767517\n");
 
@@ -641,44 +312,11 @@ int main(int argc, char** argv)
             // weight
             std::string output_name = get_mlir_value_uniq_id(operation.getResult(0));
             weights[output_name] = operation.getAttr("value");
-            continue;
-        }
-        else
-        {
-            bool isBinaryOp = false;
-            // TODO add more binaryop
-            if (op == "tf.BiasAdd" || op == "tf.AddV2" || op == "tf.Sub" || op == "tf.Maximum" || op == "tf.Minimum" || op == "tf.Mul")
-            {
-                isBinaryOp = true;
-            }
-
-            if (isBinaryOp)
-            {
-                // check weights
-                for (int j = 0; j < num_input; j++)
-                {
-                    std::string input_name = get_mlir_value_uniq_id(operation.getOperand(j));
-
-                    std::map<std::string, mlir::Attribute>::iterator it = weights.find(input_name);
-                    if (it != weights.end())
-                    {
-                        // binary op with weight, insert MemoryData layer and const blob
-                        binaryop_weights[input_name] = it->second;
-                        weights.erase(it);
-                    }
-                }
-            }
         }
 
         for (int j = 0; j < num_input; j++)
         {
             std::string input_name = get_mlir_value_uniq_id(operation.getOperand(j));
-
-            // check weight
-            if (weights.find(input_name) != weights.end())
-            {
-                continue;
-            }
 
             blob_names.insert(input_name);
 
@@ -697,29 +335,234 @@ int main(int argc, char** argv)
             std::string output_name = get_mlir_value_uniq_id(operation.getResult(j));
 
             blob_names.insert(output_name);
+
+            node_reference[output_name] = 0;
         }
+    }
+
+    // reduce common const weight node_reference
+    for (const mlir::Operation& _operation : operations)
+    {
+        mlir::Operation& operation = const_cast<mlir::Operation&>(_operation);
+
+        std::string op = operation.getName().getStringRef().str();
+
+        if (op == "ncnn.KerasConv2D")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            node_reference[weight_name] -= 1;
+            node_reference[bias_name] -= 1;
+        }
+        else if (op == "ncnn.KerasDense")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            node_reference[weight_name] -= 1;
+            node_reference[bias_name] -= 1;
+        }
+        else if (op == "ncnn.KerasBatchNorm")
+        {
+            std::string gamma_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            node_reference[gamma_name] -= 1;
+            node_reference[bias_name] -= 1;
+        }
+        else if (op == "ncnn.InstanceNormAffine")
+        {
+            std::string gamma_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            node_reference[gamma_name] -= 1;
+            node_reference[bias_name] -= 1;
+        }
+        else if (op == "tf.ConcatV2")
+        {
+            std::string axis_name = get_mlir_value_uniq_id(operation.getOperand(operation.getNumOperands() - 1));
+            node_reference[axis_name] -= 1;
+        }
+        else if (op == "tf.Conv2D")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.Conv2DBackpropInput")
+        {
+            std::string output_shape_name = get_mlir_value_uniq_id(operation.getOperand(0));
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[output_shape_name] -= 1;
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.DepthwiseConv2dNative")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.MatMul")
+        {
+            int transpose_a = get_operation_attr_b(operation, "transpose_a");
+            int transpose_b = get_operation_attr_b(operation, "transpose_b");
+
+            if (transpose_a == 0 && transpose_b == 1)
+            {
+                // InnerProduct-like A * B + C
+                std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+                node_reference[weight_name] -= 1;
+            }
+        }
+        else if (op == "tf.Mean")
+        {
+            std::string reduction_indices_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[reduction_indices_name] -= 1;
+        }
+        else if (op == "tf.Pad")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.Reshape")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.ResizeBilinear")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.ResizeNearestNeighbor")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            node_reference[weight_name] -= 1;
+        }
+        else if (op == "tf.StridedSlice")
+        {
+            std::string begin_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string end_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            std::string strides_name = get_mlir_value_uniq_id(operation.getOperand(3));
+            node_reference[begin_name] -= 1;
+            node_reference[end_name] -= 1;
+            node_reference[strides_name] -= 1;
+        }
+    }
+
+    // count all weight node with zero reference
+    int zero_reference_weight_node_count = 0;
+    for (std::map<std::string, mlir::Attribute>::iterator it = weights.begin(); it != weights.end(); it++)
+    {
+        const std::string& input_name = it->first;
+
+        int refcount = node_reference[input_name];
+        if (refcount == 0)
+            zero_reference_weight_node_count++;
     }
 
     // remove node_reference entry with reference equals to one
+    int split_layer_count = 0;
     int splitncnn_blob_count = 0;
-    std::map<std::string, int>::iterator it = node_reference.begin();
-    while (it != node_reference.end())
+    // split node reference
+    std::map<std::string, int> split_node_reference;
+    for (std::map<std::string, int>::iterator it = node_reference.begin(); it != node_reference.end(); it++)
     {
-        if (it->second == 1)
+        if (it->second > 1)
         {
-            node_reference.erase(it++);
-        }
-        else
-        {
+            split_layer_count++;
             splitncnn_blob_count += it->second;
-            //             fprintf(stderr, "%s %d\n", it->first.c_str(), it->second);
-            ++it;
+
+            split_node_reference[it->first] = it->second;
         }
     }
 
-    fprintf(pp, "%lu %lu\n", node_count + node_reference.size() - weights.size(), blob_names.size() + splitncnn_blob_count);
+    fprintf(pp, "%lu %lu\n", node_count - zero_reference_weight_node_count + split_layer_count, blob_names.size() - zero_reference_weight_node_count + splitncnn_blob_count);
 
     int internal_split = 0;
+
+    // place MemoryData next
+    for (std::map<std::string, mlir::Attribute>::iterator weight_it = weights.begin(); weight_it != weights.end(); weight_it++)
+    {
+        const std::string& input_name = weight_it->first;
+
+        int refcount = node_reference[input_name];
+        if (refcount == 0)
+        {
+            continue;
+        }
+
+        fprintf(pp, "%-16s %-24s 0 1 %s", "MemoryData", input_name.c_str(), input_name.c_str());
+
+        const mlir::Attribute& M = weights[input_name];
+
+        llvm::ArrayRef<int64_t> shape = M.getType().cast<mlir::RankedTensorType>().getShape();
+
+        // c wc hwc
+        if (shape.size() == 0)
+        {
+            // scalar
+            fprintf(pp, " 0=1");
+        }
+        else if (shape.size() == 1)
+        {
+            fprintf(pp, " 0=%d", (int)shape[0]);
+        }
+        else if (shape.size() == 2)
+        {
+            fprintf(pp, " 0=%d", (int)shape[1]);
+            fprintf(pp, " 1=%d", (int)shape[0]);
+        }
+        else if (shape.size() == 3)
+        {
+            fprintf(pp, " 0=%d", (int)shape[1]);
+            fprintf(pp, " 1=%d", (int)shape[0]);
+            fprintf(pp, " 2=%d", (int)shape[2]);
+        }
+
+        fprintf(pp, "\n");
+
+        std::vector<float> v = get_attr_af(M);
+
+        if (shape.size() != 3)
+        {
+            fwrite(v.data(), sizeof(float), v.size(), bp);
+        }
+        else
+        {
+            int w = (int)shape[1];
+            int h = (int)shape[0];
+            int c = (int)shape[2];
+
+            float tmp;
+            // h-w-c to c-h-w
+            for (int p = 0; p < c; p++)
+            {
+                for (int i = 0; i < h; i++)
+                {
+                    for (int j = 0; j < w; j++)
+                    {
+                        tmp = v[i * w * c + j * c + p];
+                        fwrite(&tmp, sizeof(float), 1, bp);
+                    }
+                }
+            }
+        }
+
+        if (refcount <= 1)
+        {
+            continue;
+        }
+
+        char splitname[256];
+        sprintf(splitname, "splitncnn_%d", internal_split);
+        fprintf(pp, "%-16s %-24s %d %d", "Split", splitname, 1, refcount);
+
+        fprintf(pp, " %s", input_name.c_str());
+
+        for (int k = 0; k < refcount; k++)
+        {
+            fprintf(pp, " %s_splitncnn_%d", input_name.c_str(), k);
+        }
+        fprintf(pp, "\n");
+
+        internal_split++;
+    }
 
     // model op
     int g_opid = 0;
@@ -740,7 +583,7 @@ int main(int argc, char** argv)
             std::string input_name = get_mlir_value_uniq_id(operation.getOperand(i));
 
             // check weight
-            if (weights.find(input_name) != weights.end())
+            if (weights.find(input_name) != weights.end() && node_reference[input_name] == 0)
             {
                 num_input--;
             }
@@ -749,6 +592,34 @@ int main(int argc, char** argv)
         if (op == "std.return")
         {
             fprintf(pp, "%-16s", "Noop");
+        }
+        else if (op == "ncnn.BinaryOp")
+        {
+            fprintf(pp, "%-16s", "BinaryOp");
+        }
+        else if (op == "ncnn.KerasConv2D")
+        {
+            fprintf(pp, "%-16s", "Convolution");
+        }
+        else if (op == "ncnn.KerasDense")
+        {
+            fprintf(pp, "%-16s", "InnerProduct");
+        }
+        else if (op == "ncnn.KerasBatchNorm")
+        {
+            fprintf(pp, "%-16s", "BatchNorm");
+        }
+        else if (op == "ncnn.InstanceNorm")
+        {
+            fprintf(pp, "%-16s", "InstanceNorm");
+        }
+        else if (op == "ncnn.InstanceNormAffine")
+        {
+            fprintf(pp, "%-16s", "InstanceNorm");
+        }
+        else if (op == "ncnn.Swish")
+        {
+            fprintf(pp, "%-16s", "Swish");
         }
         else if (op == "tf.AddN")
         {
@@ -772,16 +643,7 @@ int main(int argc, char** argv)
         }
         else if (op == "tf.Const")
         {
-            // check weight before BinaryOp
-            std::string output_name = get_mlir_value_uniq_id(operation.getResult(0));
-            if (binaryop_weights.find(output_name) != binaryop_weights.end())
-            {
-                fprintf(pp, "%-16s", "MemoryData");
-            }
-            else
-            {
-                continue;
-            }
+            continue;
         }
         else if (op == "tf.Conv2D")
         {
@@ -790,6 +652,10 @@ int main(int argc, char** argv)
         else if (op == "tf.Conv2DBackpropInput")
         {
             fprintf(pp, "%-16s", "Deconvolution");
+        }
+        else if (op == "tf.DepthToSpace")
+        {
+            fprintf(pp, "%-16s", "PixelShuffle");
         }
         else if (op == "tf.DepthwiseConv2dNative")
         {
@@ -805,7 +671,18 @@ int main(int argc, char** argv)
         }
         else if (op == "tf.MatMul")
         {
-            fprintf(pp, "%-16s", "InnerProduct");
+            int transpose_a = get_operation_attr_b(operation, "transpose_a");
+            int transpose_b = get_operation_attr_b(operation, "transpose_b");
+
+            if (transpose_a == 0 && transpose_b == 1)
+            {
+                // InnerProduct-like A * B + C
+                fprintf(pp, "%-16s", "InnerProduct");
+            }
+            else
+            {
+                fprintf(pp, "%-16s", "Gemm");
+            }
         }
         else if (op == "tf.Maximum")
         {
@@ -831,7 +708,6 @@ int main(int argc, char** argv)
             }
             else
             {
-                fprintf(stderr, "tf.Mean is not global avg pooling\n");
                 fprintf(pp, "%-16s", "Reduction");
             }
         }
@@ -879,6 +755,10 @@ int main(int argc, char** argv)
         {
             fprintf(pp, "%-16s", "Softmax");
         }
+        else if (op == "tf.SpaceToDepth")
+        {
+            fprintf(pp, "%-16s", "Reorg");
+        }
         else if (op == "tf.StridedSlice")
         {
             fprintf(pp, "%-16s", "Crop");
@@ -898,22 +778,25 @@ int main(int argc, char** argv)
             fprintf(pp, "%-16s", op.c_str());
         }
 
-        fprintf(pp, " op_%d %d %d", opid, num_input, num_output);
+        char opid_name[64];
+        sprintf(opid_name, "op_%d", opid);
+
+        fprintf(pp, " %-24s %d %d", opid_name, num_input, num_output);
 
         for (int i = 0; i < (int)operation.getNumOperands(); i++)
         {
             std::string input_name = get_mlir_value_uniq_id(operation.getOperand(i));
 
             // check weight
-            if (weights.find(input_name) != weights.end())
+            if (weights.find(input_name) != weights.end() && node_reference[input_name] == 0)
             {
                 continue;
             }
 
-            if (node_reference.find(input_name) != node_reference.end())
+            if (split_node_reference.find(input_name) != split_node_reference.end())
             {
-                int refidx = node_reference[input_name] - 1;
-                node_reference[input_name] = refidx;
+                int refidx = split_node_reference[input_name] - 1;
+                split_node_reference[input_name] = refidx;
 
                 char splitsuffix[256];
                 sprintf(splitsuffix, "_splitncnn_%d", refidx);
@@ -932,6 +815,199 @@ int main(int argc, char** argv)
         if (op == "std.return")
         {
         }
+        else if (op == "ncnn.BinaryOp")
+        {
+            int op_type = get_operation_attr_i(operation, "op_type");
+            int with_scalar = get_operation_attr_i(operation, "with_scalar");
+            float b = get_operation_attr_f(operation, "b");
+
+            fprintf(pp, " 0=%d", op_type);
+            fprintf(pp, " 1=%d", with_scalar);
+            fprintf(pp, " 2=%e", b);
+        }
+        else if (op == "ncnn.KerasConv2D")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            const mlir::Attribute& W = weights[weight_name];
+            const mlir::Attribute& B = weights[bias_name];
+
+            llvm::ArrayRef<int64_t> shape = W.getType().cast<mlir::RankedTensorType>().getShape();
+
+            //             assert(shape.size() == 4)
+
+            // kh-kw-inch-outch
+            int kernel_size_h = shape[0];
+            int kernel_size_w = shape[1];
+            int num_input = shape[2];
+            int num_output = shape[3];
+            int weight_data_size = kernel_size_h * kernel_size_w * num_input * num_output;
+
+            fprintf(pp, " 0=%d", num_output);
+            fprintf(pp, " 1=%d", kernel_size_w);
+            fprintf(pp, " 11=%d", kernel_size_h);
+            fprintf(pp, " 6=%d", weight_data_size);
+
+            std::vector<int> dilations = get_operation_attr_ai(operation, "dilations");
+            std::vector<int> strides = get_operation_attr_ai(operation, "strides");
+            std::string padding = get_operation_attr_s(operation, "padding");
+
+            if (dilations.size() == 4)
+            {
+                fprintf(pp, " 2=%d", dilations[2]);
+                fprintf(pp, " 12=%d", dilations[1]);
+            }
+
+            if (strides.size() == 4)
+            {
+                fprintf(pp, " 3=%d", strides[2]);
+                fprintf(pp, " 13=%d", strides[1]);
+            }
+
+            if (padding == "EXPLICIT")
+            {
+                // nhwc = [[0, 0], [pad_top, pad_bottom], [pad_left, pad_right], [0, 0]]
+                std::vector<int> explicit_paddings = get_operation_attr_ai(operation, "explicit_paddings");
+
+                fprintf(pp, " 4=%d", explicit_paddings[4]);
+                fprintf(pp, " 15=%d", explicit_paddings[5]);
+                fprintf(pp, " 14=%d", explicit_paddings[2]);
+                fprintf(pp, " 16=%d", explicit_paddings[3]);
+            }
+            else if (padding == "VALID")
+            {
+                fprintf(pp, " 4=%d", 0);
+            }
+            else if (padding == "SAME")
+            {
+                fprintf(pp, " 4=%d", -233);
+            }
+
+            fprintf(pp, " 5=1"); // bias_term
+
+            std::vector<float> v = get_attr_af(W);
+            std::vector<float> bv = get_attr_af(B);
+
+            // reorder h-w-i-o to o-i-h-w
+            {
+                int quantize_tag = 0;
+                fwrite(&quantize_tag, sizeof(int), 1, bp);
+
+                float tmp;
+                for (int p = 0; p < num_output; p++)
+                {
+                    for (int q = 0; q < num_input; q++)
+                    {
+                        for (int i = 0; i < kernel_size_h; i++)
+                        {
+                            for (int j = 0; j < kernel_size_w; j++)
+                            {
+                                tmp = v[i * kernel_size_w * num_input * num_output + j * num_input * num_output + q * num_output + p];
+                                fwrite(&tmp, sizeof(float), 1, bp);
+                            }
+                        }
+                    }
+                }
+            }
+
+            fwrite(bv.data(), sizeof(float), bv.size(), bp);
+        }
+        else if (op == "ncnn.KerasDense")
+        {
+            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            const mlir::Attribute& W = weights[weight_name];
+            const mlir::Attribute& B = weights[bias_name];
+
+            llvm::ArrayRef<int64_t> shape = W.getType().cast<mlir::RankedTensorType>().getShape();
+
+            //             assert(shape.size() == 2)
+
+            // inch-outch
+            int num_input = shape[0];
+            int num_output = shape[1];
+            int weight_data_size = shape[0] * shape[1];
+
+            fprintf(pp, " 0=%d", num_output);
+            fprintf(pp, " 1=1"); // bias_term
+            fprintf(pp, " 2=%d", weight_data_size);
+
+            std::vector<float> v = get_attr_af(W);
+            std::vector<float> bv = get_attr_af(B);
+
+            // reorder i-o to o-i
+            {
+                int quantize_tag = 0;
+                fwrite(&quantize_tag, sizeof(int), 1, bp);
+
+                float tmp;
+                for (int p = 0; p < num_output; p++)
+                {
+                    for (int q = 0; q < num_input; q++)
+                    {
+                        tmp = v[q * num_output + p];
+                        fwrite(&tmp, sizeof(float), 1, bp);
+                    }
+                }
+            }
+
+            fwrite(bv.data(), sizeof(float), bv.size(), bp);
+        }
+        else if (op == "ncnn.KerasBatchNorm")
+        {
+            std::string gamma_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string bias_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            const mlir::Attribute& W = weights[gamma_name];
+            const mlir::Attribute& B = weights[bias_name];
+
+            std::vector<float> v = get_attr_af(W);
+            std::vector<float> bv = get_attr_af(B);
+
+            int channels = v.size();
+
+            fprintf(pp, " 0=%d", channels);
+
+            std::vector<float> mean(channels, 0.f);
+            std::vector<float> var(channels, 1.f);
+
+            fwrite(v.data(), sizeof(float), channels, bp);
+            fwrite(mean.data(), sizeof(float), channels, bp);
+            fwrite(var.data(), sizeof(float), channels, bp);
+            fwrite(bv.data(), sizeof(float), channels, bp);
+        }
+        else if (op == "ncnn.InstanceNorm")
+        {
+            float eps = get_operation_attr_f(operation, "epsilon");
+
+            fprintf(pp, " 0=0"); // channels
+            fprintf(pp, " 1=%e", eps);
+            fprintf(pp, " 2=0"); // affine
+        }
+        else if (op == "ncnn.InstanceNormAffine")
+        {
+            float eps = get_operation_attr_f(operation, "epsilon");
+
+            std::string gamma_name = get_mlir_value_uniq_id(operation.getOperand(1));
+            std::string beta_name = get_mlir_value_uniq_id(operation.getOperand(2));
+            const mlir::Attribute& G = weights[gamma_name];
+            const mlir::Attribute& B = weights[beta_name];
+
+            std::vector<float> gv = get_attr_af(G);
+            std::vector<float> bv = get_attr_af(B);
+
+            int channels = gv.size();
+
+            fprintf(pp, " 0=%d", channels);
+            fprintf(pp, " 1=%e", eps);
+            fprintf(pp, " 2=1"); // affine
+
+            fwrite(gv.data(), sizeof(float), gv.size(), bp);
+            fwrite(bv.data(), sizeof(float), bv.size(), bp);
+        }
+        else if (op == "ncnn.Swish")
+        {
+            // no param
+        }
         else if (op == "tf.AddN")
         {
             int op_type = 1;
@@ -947,6 +1023,8 @@ int main(int argc, char** argv)
             std::vector<int> ksize = get_operation_attr_ai(operation, "ksize");
             std::vector<int> strides = get_operation_attr_ai(operation, "strides");
             std::string padding = get_operation_attr_s(operation, "padding");
+
+            fprintf(pp, " 0=1"); // avg pool
 
             if (ksize.size() == 4)
             {
@@ -1012,63 +1090,7 @@ int main(int argc, char** argv)
         }
         else if (op == "tf.Const")
         {
-            // check weight before BinaryOp
-            std::string output_name = get_mlir_value_uniq_id(operation.getResult(0));
-            if (binaryop_weights.find(output_name) != binaryop_weights.end())
-            {
-                const mlir::Attribute& M = binaryop_weights[output_name];
-
-                llvm::ArrayRef<int64_t> shape = M.getType().cast<mlir::RankedTensorType>().getShape();
-
-                // c wc hwc
-                if (shape.size() == 0)
-                {
-                    // scalar
-                    fprintf(pp, " 0=1");
-                }
-                else if (shape.size() == 1)
-                {
-                    fprintf(pp, " 0=%d", (int)shape[0]);
-                }
-                else if (shape.size() == 2)
-                {
-                    fprintf(pp, " 0=%d", (int)shape[1]);
-                    fprintf(pp, " 1=%d", (int)shape[0]);
-                }
-                else if (shape.size() == 3)
-                {
-                    fprintf(pp, " 0=%d", (int)shape[1]);
-                    fprintf(pp, " 1=%d", (int)shape[0]);
-                    fprintf(pp, " 2=%d", (int)shape[2]);
-                }
-
-                std::vector<float> v = get_attr_af(M);
-
-                if (shape.size() != 3)
-                {
-                    fwrite(v.data(), sizeof(float), v.size(), bp);
-                }
-                else
-                {
-                    int w = (int)shape[1];
-                    int h = (int)shape[0];
-                    int c = (int)shape[2];
-
-                    float tmp;
-                    // h-w-c to c-h-w
-                    for (int p = 0; p < c; p++)
-                    {
-                        for (int i = 0; i < h; i++)
-                        {
-                            for (int j = 0; j < w; j++)
-                            {
-                                tmp = v[i * w * c + j * c + p];
-                                fwrite(&tmp, sizeof(float), 1, bp);
-                            }
-                        }
-                    }
-                }
-            }
+            // never reach here
         }
         else if (op == "tf.Conv2D")
         {
@@ -1238,6 +1260,12 @@ int main(int argc, char** argv)
                 }
             }
         }
+        else if (op == "tf.DepthToSpace")
+        {
+            int block_size = get_operation_attr_i(operation, "block_size");
+            fprintf(pp, " 0=%d", block_size);
+            fprintf(pp, " 1=1"); // mode
+        }
         else if (op == "tf.DepthwiseConv2dNative")
         {
             std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
@@ -1334,37 +1362,52 @@ int main(int argc, char** argv)
         }
         else if (op == "tf.MatMul")
         {
-            std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
-            const mlir::Attribute& W = weights[weight_name];
+            int transpose_a = get_operation_attr_b(operation, "transpose_a");
+            int transpose_b = get_operation_attr_b(operation, "transpose_b");
 
-            llvm::ArrayRef<int64_t> shape = W.getType().cast<mlir::RankedTensorType>().getShape();
-
-            //             assert(shape.size() == 2)
-
-            // inch-outch
-            int num_input = shape[0];
-            int num_output = shape[1];
-            int weight_data_size = shape[0] * shape[1];
-
-            fprintf(pp, " 0=%d", num_output);
-            fprintf(pp, " 2=%d", weight_data_size);
-
-            std::vector<float> v = get_attr_af(W);
-
-            // reorder i-o to o-i
+            if (transpose_a == 0 && transpose_b == 1)
             {
-                int quantize_tag = 0;
-                fwrite(&quantize_tag, sizeof(int), 1, bp);
+                // InnerProduct-like A * B + C
+                std::string weight_name = get_mlir_value_uniq_id(operation.getOperand(1));
+                const mlir::Attribute& W = weights[weight_name];
 
-                float tmp;
-                for (int p = 0; p < num_output; p++)
+                llvm::ArrayRef<int64_t> shape = W.getType().cast<mlir::RankedTensorType>().getShape();
+
+                //             assert(shape.size() == 2)
+
+                // inch-outch
+                int num_input = shape[0];
+                int num_output = shape[1];
+                int weight_data_size = shape[0] * shape[1];
+
+                fprintf(pp, " 0=%d", num_output);
+                fprintf(pp, " 2=%d", weight_data_size);
+
+                std::vector<float> v = get_attr_af(W);
+
+                // reorder i-o to o-i
                 {
-                    for (int q = 0; q < num_input; q++)
+                    int quantize_tag = 0;
+                    fwrite(&quantize_tag, sizeof(int), 1, bp);
+
+                    float tmp;
+                    for (int p = 0; p < num_output; p++)
                     {
-                        tmp = v[q * num_output + p];
-                        fwrite(&tmp, sizeof(float), 1, bp);
+                        for (int q = 0; q < num_input; q++)
+                        {
+                            tmp = v[q * num_output + p];
+                            fwrite(&tmp, sizeof(float), 1, bp);
+                        }
                     }
                 }
+            }
+            else
+            {
+                // gemm
+                fprintf(pp, " 0=1.0"); // alpha
+                fprintf(pp, " 1=1.0"); // beta
+                fprintf(pp, " 2=%d", transpose_a);
+                fprintf(pp, " 3=%d", transpose_b);
             }
         }
         else if (op == "tf.Maximum")
@@ -1377,6 +1420,8 @@ int main(int argc, char** argv)
             std::vector<int> ksize = get_operation_attr_ai(operation, "ksize");
             std::vector<int> strides = get_operation_attr_ai(operation, "strides");
             std::string padding = get_operation_attr_s(operation, "padding");
+
+            fprintf(pp, " 0=0"); // max pool
 
             if (ksize.size() == 4)
             {
@@ -1422,7 +1467,20 @@ int main(int argc, char** argv)
             }
             else
             {
-                // TODO
+                // Reduction mean
+                fprintf(pp, " 0=3");
+                fprintf(pp, " 1=0"); // reduce_all
+                fprintf(pp, " -23303=%d", (int)v.size());
+                for (int i = 0; i < (int)v.size(); i++)
+                {
+                    if (v[i] == 1)
+                        fprintf(pp, ",2");
+                    if (v[i] == 2)
+                        fprintf(pp, ",3");
+                    if (v[i] == 3)
+                        fprintf(pp, ",1");
+                }
+                fprintf(pp, " 4=%d", keep_dims);
             }
         }
         else if (op == "tf.Minimum")
@@ -1528,6 +1586,12 @@ int main(int argc, char** argv)
         }
         else if (op == "tf.Softmax")
         {
+        }
+        else if (op == "tf.SpaceToDepth")
+        {
+            int block_size = get_operation_attr_i(operation, "block_size");
+            fprintf(pp, " 0=%d", block_size);
+            fprintf(pp, " 1=1"); // mode
         }
         else if (op == "tf.StridedSlice")
         {

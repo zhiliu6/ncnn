@@ -16,8 +16,6 @@
 
 #include "layer_shader_type.h"
 
-#include <algorithm>
-
 namespace ncnn {
 
 Interp_vulkan::Interp_vulkan()
@@ -89,18 +87,19 @@ int Interp_vulkan::create_pipeline(const Option& _opt)
 
     if (resize_type == 1 || resize_type == 2)
     {
-        std::vector<vk_specialization_type> specializations(1 + 10);
+        std::vector<vk_specialization_type> specializations(2 + 10);
         specializations[0].i = resize_type;
-        specializations[1 + 0].i = shape_packed.dims;
-        specializations[1 + 1].i = shape_packed.w;
-        specializations[1 + 2].i = shape_packed.h;
-        specializations[1 + 3].i = shape_packed.c;
-        specializations[1 + 4].i = shape_packed.cstep;
-        specializations[1 + 5].i = out_shape_packed.dims;
-        specializations[1 + 6].i = out_shape_packed.w;
-        specializations[1 + 7].i = out_shape_packed.h;
-        specializations[1 + 8].i = out_shape_packed.c;
-        specializations[1 + 9].i = out_shape_packed.cstep;
+        specializations[1].i = align_corner;
+        specializations[2 + 0].i = shape_packed.dims;
+        specializations[2 + 1].i = shape_packed.w;
+        specializations[2 + 2].i = shape_packed.h;
+        specializations[2 + 3].i = shape_packed.c;
+        specializations[2 + 4].i = shape_packed.cstep;
+        specializations[2 + 5].i = out_shape_packed.dims;
+        specializations[2 + 6].i = out_shape_packed.w;
+        specializations[2 + 7].i = out_shape_packed.h;
+        specializations[2 + 8].i = out_shape_packed.c;
+        specializations[2 + 9].i = out_shape_packed.cstep;
 
         Mat local_size_xyz;
         if (out_shape_packed.dims == 2)
@@ -265,19 +264,121 @@ int Interp_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute&
 {
     int w = bottom_blob.w;
     int h = bottom_blob.h;
+
+    int outw = output_width;
+    int outh = output_height;
+    if (bottom_blob.dims == 1)
+    {
+        w = 1;
+        h = 1;
+    }
+    if (outw == 0 || outh == 0)
+    {
+        outw = static_cast<int>(w * width_scale);
+        outh = static_cast<int>(h * height_scale);
+    }
+
+    VkMat reference_blob;
+    reference_blob.w = outw;
+    reference_blob.h = outh;
+
+    std::vector<VkMat> bottom_blobs(2);
+    bottom_blobs[0] = bottom_blob;
+    bottom_blobs[1] = reference_blob;
+
+    std::vector<VkMat> top_blobs(1);
+
+    int ret = forward(bottom_blobs, top_blobs, cmd, opt);
+
+    top_blob = top_blobs[0];
+
+    return ret;
+}
+
+int Interp_vulkan::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+
+    int outw = output_width;
+    int outh = output_height;
+    if (bottom_blob.dims == 1)
+    {
+        w = 1;
+        h = 1;
+    }
+    if (outw == 0 || outh == 0)
+    {
+        outw = static_cast<int>(w * width_scale);
+        outh = static_cast<int>(h * height_scale);
+    }
+
+    VkImageMat reference_blob;
+    reference_blob.w = outw;
+    reference_blob.h = outh;
+
+    std::vector<VkImageMat> bottom_blobs(2);
+    bottom_blobs[0] = bottom_blob;
+    bottom_blobs[1] = reference_blob;
+
+    std::vector<VkImageMat> top_blobs(1);
+
+    int ret = forward(bottom_blobs, top_blobs, cmd, opt);
+
+    top_blob = top_blobs[0];
+
+    return ret;
+}
+
+int Interp_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& top_blobs, VkCompute& cmd, const Option& opt) const
+{
+    const VkMat& bottom_blob = bottom_blobs[0];
+    const VkMat& reference_blob = bottom_blobs[1];
+    VkMat& top_blob = top_blobs[0];
+
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    int outw = output_width;
-    int outh = output_height;
-    if (outw == 0 || outh == 0)
+    int outw = reference_blob.w;
+    int outh = reference_blob.h;
+
+    if (bottom_blob.dims == 1)
     {
-        outw = w * width_scale;
-        outh = h * height_scale;
+        top_blob.create(outw, outh, w, elemsize, elempack, opt.blob_vkallocator);
+        if (top_blob.empty())
+            return -100;
+
+        std::vector<VkMat> bindings(2);
+        bindings[0] = bottom_blob;
+        bindings[1] = top_blob;
+
+        std::vector<vk_constant_type> constants(12);
+        constants[0].i = bottom_blob.dims;
+        constants[1].i = bottom_blob.w;
+        constants[2].i = bottom_blob.h;
+        constants[3].i = bottom_blob.c;
+        constants[4].i = bottom_blob.cstep;
+        constants[5].i = top_blob.dims;
+        constants[6].i = top_blob.w;
+        constants[7].i = top_blob.h;
+        constants[8].i = top_blob.c;
+        constants[9].i = top_blob.cstep;
+        constants[10].f = w / (float)outw;
+        constants[11].f = h / (float)outh;
+
+        const Pipeline* pipeline = elempack == 8 ? pipeline_interp_pack8
+                                   : elempack == 4 ? pipeline_interp_pack4
+                                   : pipeline_interp;
+
+        cmd.record_pipeline(pipeline, bindings, constants, top_blob);
+
+        return 0;
     }
 
-    if (outh == h && outw == w)
+    if (outw == w && outh == h)
     {
         top_blob = bottom_blob;
         return 0;
@@ -306,6 +407,12 @@ int Interp_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute&
         constants[9].i = top_blob.cstep;
         constants[10].f = w / (float)outw;
         constants[11].f = h / (float)outh;
+
+        if (resize_type == 2 && align_corner)
+        {
+            constants[10].f = (w - 1) / (float)(outw - 1);
+            constants[11].f = (h - 1) / (float)(outh - 1);
+        }
 
         const Pipeline* pipeline = elempack == 8 ? pipeline_interp_pack8
                                    : elempack == 4 ? pipeline_interp_pack4
@@ -389,23 +496,55 @@ int Interp_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute&
     return 0;
 }
 
-int Interp_vulkan::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const
+int Interp_vulkan::forward(const std::vector<VkImageMat>& bottom_blobs, std::vector<VkImageMat>& top_blobs, VkCompute& cmd, const Option& opt) const
 {
+    const VkImageMat& bottom_blob = bottom_blobs[0];
+    const VkImageMat& reference_blob = bottom_blobs[1];
+    VkImageMat& top_blob = top_blobs[0];
+
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    int outw = output_width;
-    int outh = output_height;
-    if (outw == 0 || outh == 0)
+    int outw = reference_blob.w;
+    int outh = reference_blob.h;
+
+    if (bottom_blob.dims == 1)
     {
-        outw = w * width_scale;
-        outh = h * height_scale;
+        top_blob.create(outw, outh, w, elemsize, elempack, opt.blob_vkallocator);
+        if (top_blob.empty())
+            return -100;
+
+        std::vector<VkImageMat> bindings(2);
+        bindings[0] = bottom_blob;
+        bindings[1] = top_blob;
+
+        std::vector<vk_constant_type> constants(12);
+        constants[0].i = bottom_blob.dims;
+        constants[1].i = bottom_blob.w;
+        constants[2].i = bottom_blob.h;
+        constants[3].i = bottom_blob.c;
+        constants[4].i = 0; //bottom_blob.cstep;
+        constants[5].i = top_blob.dims;
+        constants[6].i = top_blob.w;
+        constants[7].i = top_blob.h;
+        constants[8].i = top_blob.c;
+        constants[9].i = 0; //top_blob.cstep;
+        constants[10].f = w / (float)outw;
+        constants[11].f = h / (float)outh;
+
+        const Pipeline* pipeline = elempack == 8 ? pipeline_interp_pack8
+                                   : elempack == 4 ? pipeline_interp_pack4
+                                   : pipeline_interp;
+
+        cmd.record_pipeline(pipeline, bindings, constants, top_blob);
+
+        return 0;
     }
 
-    if (outh == h && outw == w)
+    if (outw == w && outh == h)
     {
         top_blob = bottom_blob;
         return 0;
@@ -434,6 +573,12 @@ int Interp_vulkan::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, 
         constants[9].i = 0; //top_blob.cstep;
         constants[10].f = w / (float)outw;
         constants[11].f = h / (float)outh;
+
+        if (resize_type == 2 && align_corner)
+        {
+            constants[10].f = (w - 1) / (float)(outw - 1);
+            constants[11].f = (h - 1) / (float)(outh - 1);
+        }
 
         const Pipeline* pipeline = elempack == 8 ? pipeline_interp_pack8
                                    : elempack == 4 ? pipeline_interp_pack4

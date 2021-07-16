@@ -16,7 +16,6 @@
 
 #include "layer_type.h"
 
-#include <algorithm>
 #include <float.h>
 
 namespace ncnn {
@@ -41,6 +40,9 @@ int Pooling::load_param(const ParamDict& pd)
     global_pooling = pd.get(4, 0);
     pad_mode = pd.get(5, 0);
     avgpool_count_include_pad = pd.get(6, 0);
+    adaptive_pooling = pd.get(7, 0);
+    out_w = pd.get(8, 0);
+    out_h = pd.get(18, out_w);
 
     return 0;
 }
@@ -94,6 +96,87 @@ int Pooling::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) c
                 }
 
                 top_blob[q] = sum / size;
+            }
+        }
+
+        return 0;
+    }
+
+    if (adaptive_pooling)
+    {
+        top_blob.create(out_w, out_h, channels, elemsize, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        if (pooling_type == PoolMethod_MAX)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < channels; q++)
+            {
+                const float* inptr = bottom_blob.channel(q);
+                float* outptr = top_blob.channel(q);
+
+                const int hk = std::max(h - out_h + 1, 1);
+                const int wk = std::max(w - out_w + 1, 1);
+
+                for (int i = 0; i < out_h; i++)
+                {
+                    int ih0 = out_h == 1 ? 0 : i * (h - hk) / (out_h - 1);
+                    int ih1 = ih0 + hk;
+                    for (int j = 0; j < out_w; j++)
+                    {
+                        int iw0 = out_w == 1 ? 0 : j * (w - wk) / (out_w - 1);
+                        int iw1 = iw0 + wk;
+
+                        float max = inptr[ih0 * w + iw0];
+                        for (int ih = ih0; ih < ih1; ih++)
+                        {
+                            for (int iw = iw0; iw < iw1; iw++)
+                            {
+                                max = std::max(max, inptr[ih * w + iw]);
+                            }
+                        }
+
+                        outptr[j] = max;
+                    }
+                    outptr += out_w;
+                }
+            }
+        }
+        else if (pooling_type == PoolMethod_AVE)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < channels; q++)
+            {
+                const float* inptr = bottom_blob.channel(q);
+                float* outptr = top_blob.channel(q);
+
+                const int hk = std::max(h - out_h + 1, 1);
+                const int wk = std::max(w - out_w + 1, 1);
+
+                for (int i = 0; i < out_h; i++)
+                {
+                    int ih0 = out_h == 1 ? 0 : i * (h - hk) / (out_h - 1);
+                    int ih1 = ih0 + hk;
+                    for (int j = 0; j < out_w; j++)
+                    {
+                        int iw0 = out_w == 1 ? 0 : j * (w - wk) / (out_w - 1);
+                        int iw1 = iw0 + wk;
+
+                        float sum = 0;
+                        for (int ih = ih0; ih < ih1; ih++)
+                        {
+                            for (int iw = iw0; iw < iw1; iw++)
+                            {
+                                sum += inptr[ih * w + iw];
+                            }
+                        }
+
+                        outptr[j] = sum / hk / wk;
+                    }
+
+                    outptr += out_w;
+                }
             }
         }
 

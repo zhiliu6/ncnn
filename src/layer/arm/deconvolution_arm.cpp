@@ -18,15 +18,18 @@
 
 #if __ARM_NEON
 #include <arm_neon.h>
-#include "neon_mathfun.h"
 #endif // __ARM_NEON
 
-#include "neon_activation.h"
+#include "arm_activation.h"
 
 namespace ncnn {
 
 #include "deconvolution_3x3.h"
 #include "deconvolution_4x4.h"
+
+#if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+#include "deconvolution_4x4_fp16s.h"
+#endif
 
 Deconvolution_arm::Deconvolution_arm()
 {
@@ -37,7 +40,9 @@ Deconvolution_arm::Deconvolution_arm()
 #endif
 #endif // __ARM_NEON
 
+#if NCNN_BF16
     support_bf16_storage = true;
+#endif
 
     activation = 0;
 }
@@ -88,10 +93,12 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
     }
 #endif
 
+#if NCNN_BF16
     if (opt.use_bf16_storage)
     {
         return create_pipeline_bf16s(opt);
     }
+#endif
 
     const int maxk = kernel_w * kernel_h;
     int num_input = weight_data_size / maxk / num_output;
@@ -305,8 +312,10 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
     }
 #endif
 
+#if NCNN_BF16
     if (opt.use_bf16_storage && elembits == 16)
         return forward_bf16s(bottom_blob, top_blob, opt);
+#endif
 
     // deconvolv with NxN kernel
     // value = value + bias
@@ -777,6 +786,14 @@ int Deconvolution_arm::create_pipeline_fp16s(const Option& opt)
                     }
                 }
             }
+        }
+    }
+
+    if (elempack == 1 && out_elempack == 1 && opt.use_fp16_arithmetic)
+    {
+        if (kernel_w == 4 && kernel_h == 4 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            ncnn::cast_float32_to_float16(weight_data, weight_data_fp16, opt);
         }
     }
 
@@ -1799,6 +1816,16 @@ int Deconvolution_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, con
 
     if (elempack == 1 && out_elempack == 1)
     {
+        if (kernel_w == 4 && kernel_h == 4 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            deconv4x4s2_fp16sa_neon(bottom_blob, top_blob_bordered, weight_data_fp16, bias_data_fp16, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else
         {
             // num_output
             #pragma omp parallel for num_threads(opt.num_threads)
@@ -1878,6 +1905,7 @@ int Deconvolution_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, con
 }
 #endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 
+#if NCNN_BF16
 int Deconvolution_arm::create_pipeline_bf16s(const Option& opt)
 {
     const int maxk = kernel_w * kernel_h;
@@ -2316,5 +2344,6 @@ int Deconvolution_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, cons
 
     return 0;
 }
+#endif // NCNN_BF16
 
 } // namespace ncnn

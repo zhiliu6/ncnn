@@ -17,8 +17,7 @@
 
 #include "yolov3detectionoutput_x86.h"
 
-#include <algorithm>
-#include <limits>
+#include <float.h>
 #include <math.h>
 
 namespace ncnn {
@@ -55,9 +54,9 @@ int Yolov3DetectionOutput_x86::forward(const std::vector<Mat>& bottom_blobs, std
         size_t mask_offset = b * num_box;
         int net_w = (int)(anchors_scale[b] * w);
         int net_h = (int)(anchors_scale[b] * h);
-        //printf("%d %d\n", net_w, net_h);
+//printf("%d %d\n", net_w, net_h);
 
-        //printf("%d %d %d\n", w, h, channels);
+//printf("%d %d %d\n", w, h, channels);
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int pp = 0; pp < num_box; pp++)
         {
@@ -91,7 +90,7 @@ int Yolov3DetectionOutput_x86::forward(const std::vector<Mat>& bottom_blobs, std
                 {
 #if 0
                     int class_index = 0;
-                    float class_score = -std::numeric_limits<float>::max();
+                    float class_score = -FLT_MAX;
                     for (int q = 0; q < num_class; q++)
                     {
                         float score = scores.channel(q).row(i)[j];
@@ -104,14 +103,15 @@ int Yolov3DetectionOutput_x86::forward(const std::vector<Mat>& bottom_blobs, std
 #else
                     // find class index with max class score
                     int class_index = 0;
-                    float class_score = -std::numeric_limits<float>::max();
+                    float class_score = -FLT_MAX;
                     float* ptr = ((float*)scores.data) + i * w + j;
                     float* end = ptr + num_class * cs;
                     int q = 0;
-#if __AVX__
+#if __AVX2__
+                    float* end8 = ptr + (num_class & -8) * cs;
                     unsigned long index;
 
-                    for (; ptr < end; ptr += 8 * cs, q += 8)
+                    for (; ptr < end8; ptr += 8 * cs, q += 8)
                     {
                         __m256 p = _mm256_i32gather_ps(ptr, vi, 4);
                         __m256 t = _mm256_max_ps(p, _mm256_permute2f128_ps(p, p, 1));

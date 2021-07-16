@@ -14,7 +14,6 @@
 
 #include "mat.h"
 
-#include <algorithm>
 #include <limits.h>
 #include <math.h>
 #if __ARM_NEON
@@ -133,7 +132,7 @@ void resize_bilinear_c1(const unsigned char* src, int srcw, int srch, int srcstr
 
     for (int dy = 0; dy < h; dy++)
     {
-        int sy = yofs[dy];
+        sy = yofs[dy];
 
         if (sy == prev_sy1)
         {
@@ -151,7 +150,7 @@ void resize_bilinear_c1(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 
@@ -172,7 +171,7 @@ void resize_bilinear_c1(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 
@@ -387,7 +386,7 @@ void resize_bilinear_c2(const unsigned char* src, int srcw, int srch, int srcstr
 
     for (int dy = 0; dy < h; dy++)
     {
-        int sy = yofs[dy];
+        sy = yofs[dy];
 
         if (sy == prev_sy1)
         {
@@ -405,7 +404,7 @@ void resize_bilinear_c2(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
 
                 const unsigned char* S1p = S1 + sx;
 #if __ARM_NEON
@@ -448,7 +447,7 @@ void resize_bilinear_c2(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 
@@ -696,7 +695,7 @@ void resize_bilinear_c3(const unsigned char* src, int srcw, int srch, int srcstr
 
     for (int dy = 0; dy < h; dy++)
     {
-        int sy = yofs[dy];
+        sy = yofs[dy];
 
         if (sy == prev_sy1)
         {
@@ -714,7 +713,7 @@ void resize_bilinear_c3(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 
@@ -759,7 +758,7 @@ void resize_bilinear_c3(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 
@@ -1016,7 +1015,7 @@ void resize_bilinear_c4(const unsigned char* src, int srcw, int srch, int srcstr
 
     for (int dy = 0; dy < h; dy++)
     {
-        int sy = yofs[dy];
+        sy = yofs[dy];
 
         if (sy == prev_sy1)
         {
@@ -1034,7 +1033,7 @@ void resize_bilinear_c4(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 
@@ -1072,7 +1071,7 @@ void resize_bilinear_c4(const unsigned char* src, int srcw, int srch, int srcstr
             short* rows1p = rows1;
             for (int dx = 0; dx < w; dx++)
             {
-                int sx = xofs[dx];
+                sx = xofs[dx];
                 short a0 = ialphap[0];
                 short a1 = ialphap[1];
 

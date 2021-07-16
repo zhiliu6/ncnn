@@ -16,10 +16,13 @@
 
 #include "cpu.h"
 
-#include <algorithm>
 #include <math.h>
 #include <string.h>
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4250)
+#endif
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Woverloaded-virtual"
@@ -27,6 +30,9 @@
 #include "layer_declaration.h"
 #ifdef __clang__
 #pragma clang diagnostic pop
+#endif
+#ifdef _MSC_VER
+#pragma warning(pop)
 #endif
 
 namespace ncnn {
@@ -40,14 +46,19 @@ Layer::Layer()
 
     support_bf16_storage = false;
     support_fp16_storage = false;
+    support_int8_storage = false;
     support_image_storage = false;
+    support_tensor_storage = false;
 
-    use_int8_inference = false;
     support_weight_fp16_storage = false;
+
+    typeindex = -1;
 
 #if NCNN_VULKAN
     vkdev = 0;
 #endif // NCNN_VULKAN
+
+    userdata = 0;
 }
 
 Layer::~Layer()
@@ -187,21 +198,7 @@ int Layer::forward_inplace(VkImageMat& /*bottom_top_blob*/, VkCompute& /*cmd*/, 
 }
 #endif // NCNN_VULKAN
 
-static const layer_registry_entry layer_registry[] = {
 #include "layer_registry.h"
-};
-
-#if NCNN_RUNTIME_CPU && NCNN_AVX2
-static const layer_registry_entry layer_registry_avx2[] = {
-#include "layer_registry_avx2.h"
-};
-#endif // NCNN_RUNTIME_CPU && NCNN_AVX2
-
-#if NCNN_RUNTIME_CPU && NCNN_ARM82
-static const layer_registry_entry layer_registry_arm82[] = {
-#include "layer_registry_arm82.h"
-};
-#endif // NCNN_RUNTIME_CPU && NCNN_ARM82
 
 static const int layer_registry_entry_count = sizeof(layer_registry) / sizeof(layer_registry_entry);
 
@@ -239,16 +236,50 @@ Layer* create_layer(int index)
     if (ncnn::cpu_support_x86_avx2())
     {
         layer_creator = layer_registry_avx2[index].creator;
+    } else
+#endif// NCNN_RUNTIME_CPU && NCNN_AVX2
+#if NCNN_RUNTIME_CPU &&  NCNN_AVX
+    if (ncnn::cpu_support_x86_avx())
+    {
+        layer_creator = layer_registry_avx[index].creator;
     }
     else
-#endif // NCNN_RUNTIME_CPU && NCNN_AVX2
-#if NCNN_RUNTIME_CPU && NCNN_ARM82
+#endif // NCNN_RUNTIME_CPU && NCNN_AVX
+#if NCNN_RUNTIME_CPU && NCNN_ARM82DOT
+    if (ncnn::cpu_support_arm_asimdhp() && ncnn::cpu_support_arm_asimddp())
+    {
+        layer_creator = layer_registry_arm82dot[index].creator;
+    }
+    else
+#endif // NCNN_RUNTIME_CPU && NCNN_ARM82DOT
+#if NCNN_RUNTIME_CPU && NCNN_ARM82 && !__APPLE__
     if (ncnn::cpu_support_arm_asimdhp())
     {
         layer_creator = layer_registry_arm82[index].creator;
     }
     else
-#endif // NCNN_RUNTIME_CPU && NCNN_ARM82
+#endif // NCNN_RUNTIME_CPU && NCNN_ARM82 && !__APPLE__
+#if NCNN_RUNTIME_CPU && NCNN_MMI
+    if (ncnn::cpu_support_mips_msa() && ncnn::cpu_support_loongson_mmi())
+    {
+        layer_creator = layer_registry_mmi[index].creator;
+    }
+    else
+#endif // NCNN_RUNTIME_CPU && NCNN_MMI
+#if NCNN_RUNTIME_CPU && NCNN_MSA
+    if (ncnn::cpu_support_mips_msa())
+    {
+        layer_creator = layer_registry_msa[index].creator;
+    }
+    else
+#endif // NCNN_RUNTIME_CPU && NCNN_MSA
+#if NCNN_RUNTIME_CPU && NCNN_RVV
+    if (ncnn::cpu_support_riscv_v())
+    {
+        layer_creator = layer_registry_rvv[index].creator;
+    }
+    else
+#endif // NCNN_RUNTIME_CPU && NCNN_RVV
     {
         layer_creator = layer_registry[index].creator;
     }
@@ -257,7 +288,7 @@ Layer* create_layer(int index)
     if (!layer_creator)
         return 0;
 
-    Layer* layer = layer_creator();
+    Layer* layer = layer_creator(0);
     layer->typeindex = index;
     return layer;
 }

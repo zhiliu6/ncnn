@@ -18,9 +18,8 @@
 #include <math.h>
 
 #if __mips_msa
-#include "mips_mathfun.h"
-
 #include <msa.h>
+#include "msa_mathfun.h"
 #endif // __mips_msa
 
 namespace ncnn {
@@ -29,8 +28,9 @@ int Softmax_mips::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 {
     int dims = bottom_top_blob.dims;
     size_t elemsize = bottom_top_blob.elemsize;
+    int positive_axis = axis < 0 ? dims + axis : axis;
 
-    if (dims != 3 || axis != 0)
+    if (dims != 3 || positive_axis != 0)
         return Softmax::forward_inplace(bottom_top_blob, opt);
 
     // value = exp( value - global max value )

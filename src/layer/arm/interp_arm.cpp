@@ -23,15 +23,20 @@
 namespace ncnn {
 
 #include "interp_bicubic.h"
-#include "interp_bicubic_bf16s.h"
 #include "interp_bilinear.h"
+
+#if NCNN_BF16
+#include "interp_bicubic_bf16s.h"
 #include "interp_bilinear_bf16s.h"
+#endif
 
 #if __ARM_NEON
 #include "interp_bicubic_pack4.h"
-#include "interp_bicubic_pack4_bf16s.h"
 #include "interp_bilinear_pack4.h"
+#if NCNN_BF16
+#include "interp_bicubic_pack4_bf16s.h"
 #include "interp_bilinear_pack4_bf16s.h"
+#endif
 #if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 #include "interp_bicubic_fp16s.h"
 #include "interp_bicubic_pack4_fp16s.h"
@@ -51,48 +56,76 @@ Interp_arm::Interp_arm()
 #endif
 #endif // __ARM_NEON
 
+#if NCNN_BF16
     support_bf16_storage = true;
+#endif
 }
 
-int Interp_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int elembits = bottom_blob.elembits();
 
 #if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
     if (opt.use_fp16_storage && elembits == 16)
     {
         if (opt.use_fp16_arithmetic)
-            return forward_fp16sa(bottom_blob, top_blob, opt);
+            return forward_fp16sa(bottom_blobs, top_blobs, opt);
         else
-            return forward_fp16s(bottom_blob, top_blob, opt);
+            return forward_fp16s(bottom_blobs, top_blobs, opt);
     }
 #endif
 
+#if NCNN_BF16
     if (opt.use_bf16_storage && elembits == 16)
-        return forward_bf16s(bottom_blob, top_blob, opt);
+        return forward_bf16s(bottom_blobs, top_blobs, opt);
+#endif
 
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
+    int outw = reference_blob.w;
+    int outh = reference_blob.h;
+
+    if (bottom_blob.dims == 1)
     {
-        return Interp::forward(bottom_blob, top_blob, opt);
+        top_blob.create(outw, outh, w, elemsize, elempack, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+#if __ARM_NEON
+        if (elempack == 4)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < w; q++)
+            {
+                Mat top_blob_c = top_blob.channel(q);
+                float32x4_t _v = vld1q_f32((const float*)bottom_blob + q * 4);
+                top_blob_c.fill(_v);
+            }
+
+            return 0;
+        }
+#endif // __ARM_NEON
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < w; q++)
+        {
+            Mat top_blob_c = top_blob.channel(q);
+            const float v = bottom_blob[q];
+            top_blob_c.fill(v);
+        }
+
+        return 0;
     }
 
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
-
-    if (outh == h && outw == w)
+    if (outw == w && outh == h)
     {
         top_blob = bottom_blob;
         return 0;
@@ -145,8 +178,8 @@ int Interp_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt
             float* alpha = (float*)(buf + outw + outh);           //new float[outw * 2];
             float* beta = (float*)(buf + outw + outh + outw * 2); //new float[outh * 2];
 
-            linear_coeffs(w, outw, xofs, alpha);
-            linear_coeffs(h, outh, yofs, beta);
+            linear_coeffs(w, outw, xofs, alpha, align_corner);
+            linear_coeffs(h, outh, yofs, beta, align_corner);
 
             #pragma omp parallel for num_threads(opt.num_threads)
             for (int q = 0; q < channels; q++)
@@ -225,8 +258,8 @@ int Interp_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt
         float* alpha = (float*)(buf + outw + outh);           //new float[outw * 2];
         float* beta = (float*)(buf + outw + outh + outw * 2); //new float[outh * 2];
 
-        linear_coeffs(w, outw, xofs, alpha);
-        linear_coeffs(h, outh, yofs, beta);
+        linear_coeffs(w, outw, xofs, alpha, align_corner);
+        linear_coeffs(h, outh, yofs, beta, align_corner);
 
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int q = 0; q < channels; q++)
@@ -269,30 +302,52 @@ int Interp_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt
 }
 
 #if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-int Interp_arm::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward_fp16s(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
+    int outw = reference_blob.w;
+    int outh = reference_blob.h;
+
+    if (bottom_blob.dims == 1)
     {
-        return Interp::forward(bottom_blob, top_blob, opt);
+        top_blob.create(outw, outh, w, elemsize, elempack, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        if (elempack == 4)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < w; q++)
+            {
+                Mat top_blob_c = top_blob.channel(q);
+                float16x4_t _v = vld1_f16((const __fp16*)bottom_blob + q * 4);
+                top_blob_c.fill(_v);
+            }
+
+            return 0;
+        }
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < w; q++)
+        {
+            Mat top_blob_c = top_blob.channel(q);
+            const __fp16* ptr = bottom_blob;
+            top_blob_c.fill(ptr[q]);
+        }
+
+        return 0;
     }
 
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
-
-    if (outh == h && outw == w)
+    if (outw == w && outh == h)
     {
         top_blob = bottom_blob;
         return 0;
@@ -344,8 +399,8 @@ int Interp_arm::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Optio
             float* alpha = (float*)(buf + outw + outh);           //new float[outw * 2];
             float* beta = (float*)(buf + outw + outh + outw * 2); //new float[outh * 2];
 
-            linear_coeffs(w, outw, xofs, alpha);
-            linear_coeffs(h, outh, yofs, beta);
+            linear_coeffs(w, outw, xofs, alpha, align_corner);
+            linear_coeffs(h, outh, yofs, beta, align_corner);
 
             #pragma omp parallel for num_threads(opt.num_threads)
             for (int q = 0; q < channels; q++)
@@ -423,8 +478,8 @@ int Interp_arm::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Optio
         float* alpha = (float*)(buf + outw + outh);           //new float[outw * 2];
         float* beta = (float*)(buf + outw + outh + outw * 2); //new float[outh * 2];
 
-        linear_coeffs(w, outw, xofs, alpha);
-        linear_coeffs(h, outh, yofs, beta);
+        linear_coeffs(w, outw, xofs, alpha, align_corner);
+        linear_coeffs(h, outh, yofs, beta, align_corner);
 
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int q = 0; q < channels; q++)
@@ -466,30 +521,65 @@ int Interp_arm::forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Optio
     return 0;
 }
 
-int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+int Interp_arm::forward_fp16sa(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
+    int outw = reference_blob.w;
+    int outh = reference_blob.h;
+
+    if (bottom_blob.dims == 1)
     {
-        return Interp::forward(bottom_blob, top_blob, opt);
+        top_blob.create(outw, outh, w, elemsize, elempack, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        if (elempack == 8)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < w; q++)
+            {
+                Mat top_blob_c = top_blob.channel(q);
+                float16x8_t _v = vld1q_f16((const __fp16*)bottom_blob + q * 8);
+                top_blob_c.fill(_v);
+            }
+
+            return 0;
+        }
+
+        if (elempack == 4)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < w; q++)
+            {
+                Mat top_blob_c = top_blob.channel(q);
+                float16x4_t _v = vld1_f16((const __fp16*)bottom_blob + q * 4);
+                top_blob_c.fill(_v);
+            }
+
+            return 0;
+        }
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < w; q++)
+        {
+            Mat top_blob_c = top_blob.channel(q);
+            const __fp16* ptr = bottom_blob;
+            top_blob_c.fill(ptr[q]);
+        }
+
+        return 0;
     }
 
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
-
-    if (outh == h && outw == w)
+    if (outw == w && outh == h)
     {
         top_blob = bottom_blob;
         return 0;
@@ -541,8 +631,8 @@ int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Opti
             __fp16* alpha = (__fp16*)(buf + outw + outh);           //new __fp16[outw * 2];
             __fp16* beta = (__fp16*)(buf + outw + outh + outw * 2); //new __fp16[outh * 2];
 
-            linear_coeffs_fp16sa(w, outw, xofs, alpha);
-            linear_coeffs_fp16sa(h, outh, yofs, beta);
+            linear_coeffs_fp16sa(w, outw, xofs, alpha, align_corner);
+            linear_coeffs_fp16sa(h, outh, yofs, beta, align_corner);
 
             #pragma omp parallel for num_threads(opt.num_threads)
             for (int q = 0; q < channels; q++)
@@ -626,8 +716,8 @@ int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Opti
             __fp16* alpha = (__fp16*)(buf + outw + outh);           //new __fp16[outw * 2];
             __fp16* beta = (__fp16*)(buf + outw + outh + outw * 2); //new __fp16[outh * 2];
 
-            linear_coeffs_fp16sa(w, outw, xofs, alpha);
-            linear_coeffs_fp16sa(h, outh, yofs, beta);
+            linear_coeffs_fp16sa(w, outw, xofs, alpha, align_corner);
+            linear_coeffs_fp16sa(h, outh, yofs, beta, align_corner);
 
             #pragma omp parallel for num_threads(opt.num_threads)
             for (int q = 0; q < channels; q++)
@@ -705,8 +795,8 @@ int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Opti
         __fp16* alpha = (__fp16*)(buf + outw + outh);           //new __fp16[outw * 2];
         __fp16* beta = (__fp16*)(buf + outw + outh + outw * 2); //new __fp16[outh * 2];
 
-        linear_coeffs_fp16sa(w, outw, xofs, alpha);
-        linear_coeffs_fp16sa(h, outh, yofs, beta);
+        linear_coeffs_fp16sa(w, outw, xofs, alpha, align_corner);
+        linear_coeffs_fp16sa(h, outh, yofs, beta, align_corner);
 
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int q = 0; q < channels; q++)
@@ -749,30 +839,55 @@ int Interp_arm::forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Opti
 }
 #endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 
-int Interp_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+#if NCNN_BF16
+int Interp_arm::forward_bf16s(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& reference_blob = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
     int h = bottom_blob.h;
     int w = bottom_blob.w;
     int channels = bottom_blob.c;
-    int dims = bottom_blob.dims;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    if (dims == 1)
+    int outw = reference_blob.w;
+    int outh = reference_blob.h;
+
+    if (bottom_blob.dims == 1)
     {
-        return Interp::forward(bottom_blob, top_blob, opt);
+        top_blob.create(outw, outh, w, elemsize, elempack, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+#if __ARM_NEON
+        if (elempack == 4)
+        {
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int q = 0; q < w; q++)
+            {
+                Mat top_blob_c = top_blob.channel(q);
+                uint16x4_t _v = vld1_u16((const unsigned short*)bottom_blob + q * 4);
+                top_blob_c.fill(_v);
+            }
+
+            return 0;
+        }
+#endif // __ARM_NEON
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < w; q++)
+        {
+            Mat top_blob_c = top_blob.channel(q);
+            const unsigned short* ptr = bottom_blob;
+            top_blob_c.fill(ptr[q]);
+        }
+
+        return 0;
     }
 
-    int outh = output_height;
-    int outw = output_width;
-
-    if (outh == 0 || outw == 0)
-    {
-        outh = h * height_scale;
-        outw = w * width_scale;
-    }
-
-    if (outh == h && outw == w)
+    if (outw == w && outh == h)
     {
         top_blob = bottom_blob;
         return 0;
@@ -825,8 +940,8 @@ int Interp_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Optio
             float* alpha = (float*)(buf + outw + outh);           //new float[outw * 2];
             float* beta = (float*)(buf + outw + outh + outw * 2); //new float[outh * 2];
 
-            linear_coeffs(w, outw, xofs, alpha);
-            linear_coeffs(h, outh, yofs, beta);
+            linear_coeffs(w, outw, xofs, alpha, align_corner);
+            linear_coeffs(h, outh, yofs, beta, align_corner);
 
             #pragma omp parallel for num_threads(opt.num_threads)
             for (int q = 0; q < channels; q++)
@@ -905,8 +1020,8 @@ int Interp_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Optio
         float* alpha = (float*)(buf + outw + outh);           //new float[outw * 2];
         float* beta = (float*)(buf + outw + outh + outw * 2); //new float[outh * 2];
 
-        linear_coeffs(w, outw, xofs, alpha);
-        linear_coeffs(h, outh, yofs, beta);
+        linear_coeffs(w, outw, xofs, alpha, align_corner);
+        linear_coeffs(h, outh, yofs, beta, align_corner);
 
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int q = 0; q < channels; q++)
@@ -947,5 +1062,6 @@ int Interp_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Optio
 
     return 0;
 }
+#endif // NCNN_BF16
 
 } // namespace ncnn
